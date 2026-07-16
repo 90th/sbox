@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sbox::{LaunchSpec, Runtime, run_omp};
+use sbox::{LaunchSpec, Runtime, discover_mcp_mounts, run_omp};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -120,6 +120,35 @@ fn allow_read_is_readable_and_read_only() {
         b"trusted context"
     );
     assert_eq!(fs::read(context).unwrap(), b"trusted context");
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn discovered_opencode_assets_are_readable_and_read_only() {
+    let fixture = Fixture::new();
+    let opencode = fixture.home.join(".config/opencode");
+    let skill = opencode.join("skills/review.md");
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    fs::write(&skill, b"review instructions").unwrap();
+    let discovery =
+        discover_mcp_mounts(&fixture.home, &fixture.project, OsStr::new("/usr/bin:/bin")).unwrap();
+    let mut spec = fixture.spec(Path::new("/usr/bin/sh"));
+    spec.read_only = discovery.mount_roots;
+
+    run_shell(
+        &spec,
+        format!(
+            "cat '{}' > copied; if printf altered > '{}'; then exit 43; fi",
+            skill.display(),
+            skill.display()
+        ),
+    );
+
+    assert_eq!(
+        fs::read(fixture.project.join("copied")).unwrap(),
+        b"review instructions"
+    );
+    assert_eq!(fs::read(skill).unwrap(), b"review instructions");
 }
 
 #[test]

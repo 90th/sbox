@@ -22,24 +22,27 @@ struct LocalServer {
 pub fn discover_mcp_mounts(home: &Path, project: &Path, host_path: &OsStr) -> Result<Discovery> {
     let mut servers = Vec::new();
     let omp_config = home.join(".omp/agent/mcp.json");
-    let opencode_config = home.join(".config/opencode/opencode.json");
+    let opencode_root = home.join(".config/opencode");
+    let opencode_config = opencode_root.join("opencode.json");
 
-    if omp_config.exists() {
+    if omp_config.is_file() {
         servers.extend(parse_omp_config(&omp_config)?);
     }
-    if opencode_config.exists() {
+    if opencode_config.is_file() {
         servers.extend(parse_opencode_config(&opencode_config)?);
     }
 
     let mut mount_roots = Vec::new();
     let mut path_dirs = Vec::new();
-    if opencode_config.exists() {
-        mount_roots.push(fs::canonicalize(&opencode_config).with_context(|| {
+    if opencode_root.is_dir() {
+        let canonical = fs::canonicalize(&opencode_root).with_context(|| {
             format!(
-                "cannot resolve trusted MCP config {}",
-                opencode_config.display()
+                "cannot resolve trusted OpenCode configuration root {}",
+                opencode_root.display()
             )
-        })?);
+        })?;
+        reject_broad_root(&canonical, home)?;
+        mount_roots.push(canonical);
     }
 
     for server in servers {
@@ -775,6 +778,26 @@ mod tests {
                 .any(|root| root.starts_with(&layout.transient))
         );
         assert!(discovery.path_dirs.contains(&layout.node.join("bin")));
+        assert!(
+            discovery
+                .mount_roots
+                .contains(&layout.home.join(".config/opencode"))
+        );
+    }
+
+    #[test]
+    fn mounts_opencode_assets_without_an_mcp_configuration() {
+        let layout = fixture_layout();
+        let opencode = layout.home.join(".config/opencode");
+        mkdir(&opencode.join("skills"));
+        fs::write(opencode.join("skills/review.md"), b"review instructions").unwrap();
+
+        let discovery =
+            discover_mcp_mounts(&layout.home, &layout.project, OsStr::new("/usr/bin:/bin"))
+                .unwrap();
+
+        assert_eq!(discovery.mount_roots, [opencode]);
+        assert!(discovery.path_dirs.is_empty());
     }
 
     #[test]
