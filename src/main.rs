@@ -18,6 +18,9 @@ fn main() -> ExitCode {
 fn execute() -> anyhow::Result<u8> {
     let cli = Cli::parse();
     let spec = cli.launch_spec()?;
+    for warning in &spec.warnings {
+        eprintln!("sbox: warning: {warning}");
+    }
     let status = run_omp(&spec, &cli.omp_args)?;
     let code = match status.code() {
         Some(code) => code,

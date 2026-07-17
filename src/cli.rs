@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::mcp::{dedupe_roots, resolve_executable, resolve_runtime};
-use crate::{LaunchSpec, discover_mcp_mounts};
+use crate::{LaunchSpec, McpDiscoveryPolicy, discover_mcp_mounts_with_policy};
 
 const FORWARDED_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
@@ -49,6 +49,9 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub pass_env: Vec<OsString>,
 
+    #[arg(long)]
+    pub strict_mcp: bool,
+
     #[arg(
         value_name = "OMP_ARGS",
         trailing_var_arg = true,
@@ -72,7 +75,14 @@ impl Cli {
             .context("cannot resolve required Bubblewrap executable")?;
         let omp = resolve_runtime(OsStr::new("omp"), &host_path, &home)
             .context("cannot resolve required OMP runtime")?;
-        let discovery = discover_mcp_mounts(&home, &project, &host_path)?;
+        let discovery = discover_mcp_mounts_with_policy(
+            &home,
+            &project,
+            &host_path,
+            McpDiscoveryPolicy {
+                strict: self.strict_mcp,
+            },
+        )?;
 
         let mut read_only = omp.mount_roots.clone();
         read_only.extend(discovery.mount_roots);
@@ -96,6 +106,7 @@ impl Cli {
             omp,
             read_only,
             environment,
+            warnings: discovery.warnings,
         })
     }
 }
@@ -199,6 +210,7 @@ mod tests {
             OsString::from("/work"),
             OsString::from("--allow-read"),
             OsString::from("/context"),
+            OsString::from("--strict-mcp"),
             OsString::from("--"),
             OsString::from("--model"),
             opaque.clone(),
@@ -206,6 +218,7 @@ mod tests {
         .unwrap();
         assert_eq!(cli.project, Path::new("/work"));
         assert_eq!(cli.allow_read, [PathBuf::from("/context")]);
+        assert!(cli.strict_mcp);
         assert_eq!(cli.omp_args, [OsString::from("--model"), opaque]);
     }
 

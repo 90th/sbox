@@ -65,6 +65,7 @@ impl Fixture {
                 ("XDG_RUNTIME_DIR".into(), format!("/run/user/{uid}").into()),
                 ("PI_CONFIG_DIR".into(), ".omp".into()),
             ]),
+            warnings: Vec::new(),
         }
     }
 }

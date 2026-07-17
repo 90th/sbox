@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value};
 
-use crate::{Discovery, Runtime};
+use crate::{Discovery, McpDiscoveryPolicy, Runtime};
 
 #[derive(Debug)]
 struct LocalServer {
@@ -20,6 +20,15 @@ struct LocalServer {
 }
 
 pub fn discover_mcp_mounts(home: &Path, project: &Path, host_path: &OsStr) -> Result<Discovery> {
+    discover_mcp_mounts_with_policy(home, project, host_path, McpDiscoveryPolicy::default())
+}
+
+pub fn discover_mcp_mounts_with_policy(
+    home: &Path,
+    project: &Path,
+    host_path: &OsStr,
+    policy: McpDiscoveryPolicy,
+) -> Result<Discovery> {
     let mut servers = Vec::new();
     let omp_config = home.join(".omp/agent/mcp.json");
     let opencode_root = home.join(".config/opencode");
@@ -34,6 +43,7 @@ pub fn discover_mcp_mounts(home: &Path, project: &Path, host_path: &OsStr) -> Re
 
     let mut mount_roots = Vec::new();
     let mut path_dirs = Vec::new();
+    let mut warnings = Vec::new();
     if opencode_root.is_dir() {
         let canonical = fs::canonicalize(&opencode_root).with_context(|| {
             format!(
@@ -46,19 +56,29 @@ pub fn discover_mcp_mounts(home: &Path, project: &Path, host_path: &OsStr) -> Re
     }
 
     for server in servers {
-        discover_server(
+        let mut server_roots = Vec::new();
+        let mut server_path_dirs = Vec::new();
+        match discover_server(
             &server,
             home,
             project,
             host_path,
-            &mut mount_roots,
-            &mut path_dirs,
-        )?;
+            &mut server_roots,
+            &mut server_path_dirs,
+        ) {
+            Ok(()) => {
+                mount_roots.extend(server_roots);
+                path_dirs.extend(server_path_dirs);
+            }
+            Err(error) if policy.strict => return Err(error),
+            Err(error) => warnings.push(format!("{error:#}")),
+        }
     }
 
     Ok(Discovery {
         mount_roots: dedupe_roots(mount_roots),
         path_dirs: dedupe_paths(path_dirs),
+        warnings,
     })
 }
 
@@ -801,22 +821,27 @@ mod tests {
     }
 
     #[test]
-    fn reports_missing_local_runtime_with_server_and_source() {
+    fn skips_missing_local_runtime_and_reports_warning() {
         let layout = fixture_layout();
         let source = layout.home.join(".omp/agent/mcp.json");
         write_json(
             &source,
             &json!({"mcpServers": {"broken": {"command": "not-present"}}}),
         );
-        let error = discover_mcp_mounts(&layout.home, &layout.project, OsStr::new("/usr/bin:/bin"))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("broken"));
-        assert!(error.contains(source.to_str().unwrap()));
+
+        let discovery =
+            discover_mcp_mounts(&layout.home, &layout.project, OsStr::new("/usr/bin:/bin"))
+                .unwrap();
+
+        assert!(discovery.mount_roots.is_empty());
+        assert!(discovery.path_dirs.is_empty());
+        let warning = discovery.warnings.join("\n");
+        assert!(warning.contains("broken"));
+        assert!(warning.contains(source.to_str().unwrap()));
     }
 
     #[test]
-    fn reports_unresolved_shebang_with_server_and_source() {
+    fn strict_policy_rejects_unresolved_shebang() {
         let layout = fixture_layout();
         let script = layout.home.join("server/run");
         executable(&script, "#!/usr/bin/env absent-interpreter\n");
@@ -825,15 +850,22 @@ mod tests {
             &source,
             &json!({"mcpServers": {"broken-shebang": {"command": script}}}),
         );
-        let error = discover_mcp_mounts(&layout.home, &layout.project, OsStr::new("/usr/bin:/bin"))
-            .unwrap_err()
-            .to_string();
+
+        let error = discover_mcp_mounts_with_policy(
+            &layout.home,
+            &layout.project,
+            OsStr::new("/usr/bin:/bin"),
+            McpDiscoveryPolicy { strict: true },
+        )
+        .unwrap_err()
+        .to_string();
+
         assert!(error.contains("broken-shebang"));
         assert!(error.contains(source.to_str().unwrap()));
     }
 
     #[test]
-    fn rejects_root_home_and_entire_user_home_inference() {
+    fn strict_policy_rejects_root_home_and_entire_user_home_inference() {
         let layout = fixture_layout();
         fs::write(layout.home.join("package.json"), b"{}").unwrap();
         let source = layout.home.join(".omp/agent/mcp.json");
@@ -851,8 +883,13 @@ mod tests {
             );
             let error = format!(
                 "{:#}",
-                discover_mcp_mounts(&layout.home, &layout.project, OsStr::new("/usr/bin:/bin"),)
-                    .unwrap_err()
+                discover_mcp_mounts_with_policy(
+                    &layout.home,
+                    &layout.project,
+                    OsStr::new("/usr/bin:/bin"),
+                    McpDiscoveryPolicy { strict: true },
+                )
+                .unwrap_err()
             );
             assert!(error.contains("broad"));
             assert!(

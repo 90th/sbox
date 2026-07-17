@@ -337,6 +337,7 @@ mod tests {
             },
             read_only: vec!["/home/u/pkg/subdir".into(), "/opt/context".into()],
             environment: BTreeMap::from([("HOME".into(), "/home/u".into())]),
+            warnings: Vec::new(),
         }
     }
 
