@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
+use crate::config::load_user_policy;
 use crate::mcp::{dedupe_roots, resolve_executable, resolve_runtime};
 use crate::{LaunchSpec, McpDiscoveryPolicy, discover_mcp_mounts_with_policy};
 
@@ -71,6 +72,7 @@ impl Cli {
         let home = fs::canonicalize(&home_path)
             .with_context(|| format!("cannot resolve HOME {}", home_path.display()))?;
         let project = resolve_directory(&self.project, "project")?;
+        let policy = load_user_policy(&home, &project)?;
         let bwrap = resolve_executable(OsStr::new("bwrap"), &host_path, None)
             .context("cannot resolve required Bubblewrap executable")?;
         let omp = resolve_runtime(OsStr::new("omp"), &host_path, &home)
@@ -80,12 +82,15 @@ impl Cli {
             &project,
             &host_path,
             McpDiscoveryPolicy {
-                strict: self.strict_mcp,
+                strict: policy.strict_mcp || self.strict_mcp,
             },
         )?;
 
         let mut read_only = omp.mount_roots.clone();
         read_only.extend(discovery.mount_roots);
+        for path in &policy.allow_read {
+            read_only.push(resolve_existing(path, "configured allow_read path")?);
+        }
         for path in &self.allow_read {
             read_only.push(resolve_existing(path, "--allow-read path")?);
         }
@@ -94,8 +99,10 @@ impl Cli {
 
         let mut path_dirs = omp.path_dirs.clone();
         path_dirs.extend(discovery.path_dirs);
+        let mut pass_env = policy.pass_env;
+        pass_env.extend(self.pass_env.iter().cloned());
         let uid = home.metadata()?.uid();
-        let environment = build_environment(&home, &project, uid, &path_dirs, &self.pass_env)?;
+        let environment = build_environment(&home, &project, uid, &path_dirs, &pass_env)?;
 
         Ok(LaunchSpec {
             bwrap,

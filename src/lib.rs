@@ -6,6 +6,7 @@ use std::process::{Command, ExitStatus};
 use anyhow::Result;
 
 pub mod cli;
+mod config;
 pub mod mcp;
 pub mod sandbox;
 
