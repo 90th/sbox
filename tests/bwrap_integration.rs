@@ -177,6 +177,46 @@ fn omp_overlay_persists_without_changing_lower_or_exposing_state() {
 
 #[test]
 #[ignore = "requires bwrap and unprivileged user namespaces"]
+fn omp_session_survives_sbox_state_deletion() {
+    let fixture = Fixture::new();
+    let spec = fixture.spec(Path::new("/usr/bin/sh"));
+    let sessions_root = fixture.home.join(".omp/agent/sessions");
+
+    run_shell(
+        &spec,
+        "mkdir -p \"$HOME/.omp/agent/sessions/project\"; printf session > \"$HOME/.omp/agent/sessions/project/persisted-session.jsonl\""
+            .into(),
+    );
+
+    let session_dir = fs::read_dir(&sessions_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .expect("sandbox did not prepare a project session directory");
+    let session_file = session_dir.join("persisted-session.jsonl");
+
+    fs::remove_dir_all(fixture.project.join(".sbox")).unwrap();
+    assert_eq!(fs::read(session_file).unwrap(), b"session");
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn omp_auth_state_survives_sbox_state_deletion() {
+    let fixture = Fixture::new();
+    let spec = fixture.spec(Path::new("/usr/bin/sh"));
+    let marker = fixture.home.join(".omp/agent/oauth-state-marker");
+
+    run_shell(
+        &spec,
+        "printf shared > \"$HOME/.omp/agent/oauth-state-marker\"".into(),
+    );
+
+    fs::remove_dir_all(fixture.project.join(".sbox")).unwrap();
+    assert_eq!(fs::read(marker).unwrap(), b"shared");
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
 fn lock_serializes_launches_sharing_an_upper() {
     let fixture = Fixture::new();
     let spec = fixture.spec(Path::new("/usr/bin/sh"));

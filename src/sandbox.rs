@@ -107,6 +107,13 @@ pub fn build_bwrap_command(
         add_parent_dirs(&mut command, &path, &mut created_parents);
         command.arg("--ro-bind").arg(&path).arg(&path);
     }
+    // OMP stores OAuth credentials in a WAL-mode SQLite database. Share the
+    // whole agent directory so agent.db, its WAL/SHM sidecars, refresh leases,
+    // and session state remain one host-backed store.
+
+    let agent_dir = spec.home.join(".omp/agent");
+    add_parent_dirs(&mut command, &agent_dir, &mut created_parents);
+    command.arg("--bind").arg(&agent_dir).arg(&agent_dir);
 
     add_parent_dirs(&mut command, &spec.project, &mut created_parents);
     command.arg("--bind").arg(&spec.project).arg(&spec.project);
@@ -238,6 +245,8 @@ fn prepare_state(spec: &LaunchSpec) -> Result<()> {
         );
     }
     ensure_private_directory(&spec.project.join(".sbox"))?;
+    prepare_shared_agent_dir(spec)?;
+
     ensure_private_directory(&spec.state_dir)?;
     ensure_private_directory(&spec.state_dir.join("omp-upper"))?;
 
@@ -249,6 +258,7 @@ fn prepare_state(spec: &LaunchSpec) -> Result<()> {
             spec.project.display()
         );
     }
+
     let lock = spec.state_dir.join("omp.lock");
     if let Ok(metadata) = fs::symlink_metadata(&lock) {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -262,6 +272,11 @@ fn prepare_state(spec: &LaunchSpec) -> Result<()> {
         .open(&lock)
         .with_context(|| format!("cannot create state lock {}", lock.display()))?;
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn prepare_shared_agent_dir(spec: &LaunchSpec) -> Result<()> {
+    ensure_private_directory(&spec.home.join(".omp/agent"))?;
     Ok(())
 }
 
@@ -354,12 +369,36 @@ mod tests {
             .windows(3)
             .position(|window| window == ["--bind", "/home/u/project", "/home/u/project"])
             .unwrap();
+        let agent_bind = args
+            .windows(3)
+            .position(|window| window == ["--bind", "/home/u/.omp/agent", "/home/u/.omp/agent"])
+            .unwrap();
         assert!(index("--lock-file") < index("--proc"));
-        assert!(index("--overlay") < project_bind);
+        assert!(index("--overlay") < agent_bind);
+        assert!(agent_bind < project_bind);
+
         assert!(project_bind < index("--clearenv"));
         assert!(index("--clearenv") < index("--chdir"));
         assert_eq!(args.iter().filter(|arg| *arg == "/home/u/pkg").count(), 2);
         assert!(!args.iter().any(|arg| arg == "/home/u/pkg/subdir"));
         assert!(!args.iter().any(|arg| arg == "--new-session"));
+    }
+    #[test]
+    fn host_agent_state_is_shared_after_overlay() {
+        let spec = fixture();
+        let command = build_bwrap_command(&spec, Path::new("/work"), &[]);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let agent_bind = args
+            .windows(3)
+            .position(|window| window == ["--bind", "/home/u/.omp/agent", "/home/u/.omp/agent"])
+            .unwrap();
+        let project_bind = args
+            .windows(3)
+            .position(|window| window == ["--bind", "/home/u/project", "/home/u/project"])
+            .unwrap();
+        assert!(agent_bind < project_bind);
     }
 }
