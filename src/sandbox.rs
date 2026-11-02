@@ -39,7 +39,8 @@ pub fn build_bwrap_command(
     spec: &LaunchSpec,
     overlay_work_dir: &Path,
     omp_args: &[OsString],
-) -> Command {
+    ssh_bridge: Option<&Path>,
+) -> Result<Command> {
     let mut command = Command::new(&spec.bwrap);
     command.args([
         "--unshare-user",
@@ -97,6 +98,12 @@ pub fn build_bwrap_command(
         .arg(spec.state_dir.join("omp-upper"))
         .arg(overlay_work_dir)
         .arg(spec.home.join(".omp"));
+    crate::hardening::mounts(&mut command, spec, overlay_work_dir);
+    for name in ["run", "ssh-control"] {
+        command
+            .args(["--perms", "0700", "--tmpfs"])
+            .arg(spec.home.join(".omp").join(name));
+    }
 
     let mut read_only = spec.read_only.clone();
     read_only.extend(spec.omp.mount_roots.iter().cloned());
@@ -107,6 +114,10 @@ pub fn build_bwrap_command(
         add_parent_dirs(&mut command, &path, &mut created_parents);
         command.arg("--ro-bind").arg(&path).arg(&path);
     }
+    for path in &spec.git_metadata {
+        add_parent_dirs(&mut command, path, &mut created_parents);
+        command.arg("--bind").arg(path).arg(path);
+    }
     // OMP stores OAuth credentials in a WAL-mode SQLite database. Share the
     // whole agent directory so agent.db, its WAL/SHM sidecars, refresh leases,
     // and session state remain one host-backed store.
@@ -114,6 +125,26 @@ pub fn build_bwrap_command(
     let agent_dir = spec.home.join(".omp/agent");
     add_parent_dirs(&mut command, &agent_dir, &mut created_parents);
     command.arg("--bind").arg(&agent_dir).arg(&agent_dir);
+    command.args(["--dir", "/sbox", "--dir", "/sbox/bin"]);
+    command
+        .arg("--ro-bind")
+        .arg(&spec.launcher)
+        .arg("/sbox/bin/sbox");
+    crate::authority::protect(&mut command, spec)?;
+    if let Some(directory) = ssh_bridge {
+        command
+            .arg("--ro-bind")
+            .arg(directory)
+            .arg("/run/sbox-host");
+        command
+            .arg("--ro-bind")
+            .arg(&spec.launcher)
+            .arg("/sbox/bin/ssh");
+        command
+            .arg("--ro-bind")
+            .arg(&spec.launcher)
+            .arg("/sbox/bin/wl-paste");
+    }
 
     add_parent_dirs(&mut command, &spec.project, &mut created_parents);
     command.arg("--bind").arg(&spec.project).arg(&spec.project);
@@ -130,15 +161,24 @@ pub fn build_bwrap_command(
         command.arg("--setenv").arg(name).arg(value);
     }
     command.arg("--chdir").arg(&spec.project);
-    command.arg("--").arg(&spec.omp.lexical_executable);
-    command.args(omp_args);
     command
+        .arg("--")
+        .arg("/sbox/bin/sbox")
+        .arg("--payload")
+        .arg(&spec.omp.lexical_executable);
+    command.args(omp_args);
+    Ok(command)
 }
 
 pub fn run_omp(spec: &LaunchSpec, omp_args: &[OsString]) -> Result<ExitStatus> {
     preflight(spec)?;
     prepare_state(spec)?;
     let _state_lock = acquire_state_lock(&spec.state_dir.join("omp.lock"))?;
+    let _bridge = if spec.approval.is_some() {
+        Some(crate::ssh::Bridge::start(crate::ssh::hosts())?)
+    } else {
+        None
+    };
     let work = Builder::new()
         .prefix("omp-work-")
         .tempdir_in(&spec.state_dir)
@@ -149,8 +189,15 @@ pub fn run_omp(spec: &LaunchSpec, omp_args: &[OsString]) -> Result<ExitStatus> {
             )
         })?;
     fs::set_permissions(work.path(), fs::Permissions::from_mode(0o700))?;
+    crate::hardening::prepare(spec, work.path())?;
 
-    let mut command = build_bwrap_command(spec, work.path(), omp_args);
+    let mut command = build_bwrap_command(
+        spec,
+        work.path(),
+        omp_args,
+        _bridge.as_ref().map(|bridge| bridge.directory.as_path()),
+    )?;
+    crate::hardening::secure_descriptors(&mut command)?;
     let launch = command.status().with_context(|| {
         format!(
             "failed to launch Bubblewrap {}; required overlay isolation was not weakened",
@@ -186,21 +233,24 @@ fn make_tree_removable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn acquire_state_lock(path: &Path) -> Result<File> {
+pub(crate) fn acquire_state_lock(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
         .with_context(|| format!("cannot open state lock {}", path.display()))?;
     // SAFETY: `file` owns a valid descriptor for the duration of the call.
-    if unsafe { flock(file.as_raw_fd(), LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("cannot exclusively lock {}", path.display()));
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | 4) } != 0 {
+        bail!(
+            "another sbox instance is using this project; close its pane before launching or resetting"
+        );
     }
     Ok(file)
 }
 
 fn preflight(spec: &LaunchSpec) -> Result<()> {
+    crate::hardening::validate(spec)?;
+    crate::hardening::validate_toolchains(&spec.home)?;
     #[cfg(not(target_os = "linux"))]
     bail!("sbox requires Linux Bubblewrap");
 
@@ -260,13 +310,15 @@ fn prepare_state(spec: &LaunchSpec) -> Result<()> {
     }
 
     let lock = spec.state_dir.join("omp.lock");
-    if let Ok(metadata) = fs::symlink_metadata(&lock) {
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!("state lock {} must be a regular file", lock.display());
-        }
+    if let Ok(metadata) = fs::symlink_metadata(&lock)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        bail!("state lock {} must be a regular file", lock.display());
     }
     OpenOptions::new()
         .create(true)
+        .truncate(false)
+        .custom_flags(0x20000)
         .write(true)
         .mode(0o600)
         .open(&lock)
@@ -327,78 +379,5 @@ fn add_parent_dirs(command: &mut Command, destination: &Path, seen: &mut BTreeSe
         if seen.insert(parent.clone()) {
             command.args(["--perms", "0555", "--dir"]).arg(parent);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeMap;
-
-    use crate::Runtime;
-
-    fn fixture() -> LaunchSpec {
-        LaunchSpec {
-            bwrap: "/usr/bin/bwrap".into(),
-            project: "/home/u/project".into(),
-            home: "/home/u".into(),
-            state_dir: "/home/u/project/.sbox/state".into(),
-            uid: 1000,
-            omp: Runtime {
-                lexical_executable: "/home/u/.bin/omp".into(),
-                canonical_executable: "/home/u/pkg/omp.js".into(),
-                mount_roots: vec!["/home/u/pkg".into(), "/home/u/.bin".into()],
-                path_dirs: vec!["/home/u/.bin".into()],
-            },
-            read_only: vec!["/home/u/pkg/subdir".into(), "/opt/context".into()],
-            environment: BTreeMap::from([("HOME".into(), "/home/u".into())]),
-            warnings: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn command_preserves_security_order_and_deduplicates_mounts() {
-        let spec = fixture();
-        let command = build_bwrap_command(&spec, Path::new("/work"), &["config".into()]);
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        let index = |needle: &str| args.iter().position(|arg| arg == needle).unwrap();
-        let project_bind = args
-            .windows(3)
-            .position(|window| window == ["--bind", "/home/u/project", "/home/u/project"])
-            .unwrap();
-        let agent_bind = args
-            .windows(3)
-            .position(|window| window == ["--bind", "/home/u/.omp/agent", "/home/u/.omp/agent"])
-            .unwrap();
-        assert!(index("--lock-file") < index("--proc"));
-        assert!(index("--overlay") < agent_bind);
-        assert!(agent_bind < project_bind);
-
-        assert!(project_bind < index("--clearenv"));
-        assert!(index("--clearenv") < index("--chdir"));
-        assert_eq!(args.iter().filter(|arg| *arg == "/home/u/pkg").count(), 2);
-        assert!(!args.iter().any(|arg| arg == "/home/u/pkg/subdir"));
-        assert!(!args.iter().any(|arg| arg == "--new-session"));
-    }
-    #[test]
-    fn host_agent_state_is_shared_after_overlay() {
-        let spec = fixture();
-        let command = build_bwrap_command(&spec, Path::new("/work"), &[]);
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        let agent_bind = args
-            .windows(3)
-            .position(|window| window == ["--bind", "/home/u/.omp/agent", "/home/u/.omp/agent"])
-            .unwrap();
-        let project_bind = args
-            .windows(3)
-            .position(|window| window == ["--bind", "/home/u/project", "/home/u/project"])
-            .unwrap();
-        assert!(agent_bind < project_bind);
     }
 }

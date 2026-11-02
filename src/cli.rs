@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -53,6 +53,24 @@ pub struct Cli {
     #[arg(long)]
     pub strict_mcp: bool,
 
+    /// Approve the current external dependency grants from the host terminal.
+    #[arg(long, conflicts_with_all = ["reset", "permissions"])]
+    pub trust: bool,
+    #[arg(long)]
+    pub permissions: bool,
+    #[arg(long, conflicts_with = "permissions")]
+    pub reset: bool,
+    #[arg(long, default_value_t = 8192)]
+    pub memory_mib: u64,
+    #[arg(long, default_value_t = 512)]
+    pub tasks_limit: u64,
+    #[arg(long, default_value_t = 400)]
+    pub cpu_percent: u32,
+    #[arg(long)]
+    pub no_limits: bool,
+    #[arg(long, hide = true)]
+    pub scoped: bool,
+
     #[arg(
         value_name = "OMP_ARGS",
         trailing_var_arg = true,
@@ -94,6 +112,7 @@ impl Cli {
         for path in &self.allow_read {
             read_only.push(resolve_existing(path, "--allow-read path")?);
         }
+        let git_metadata = crate::lifecycle::git_metadata(&project)?;
         read_only.retain(|path| !path.starts_with(&project));
         let read_only = dedupe_roots(read_only);
 
@@ -114,6 +133,9 @@ impl Cli {
             read_only,
             environment,
             warnings: discovery.warnings,
+            approval: None,
+            git_metadata,
+            launcher: std::env::current_exe()?,
         })
     }
 }
@@ -151,13 +173,23 @@ fn build_environment(
         OsString::from(format!("/run/user/{uid}")),
     );
     result.insert("PI_CONFIG_DIR".into(), ".omp".into());
-
-    let mut dirs = BTreeSet::new();
-    for directory in path_dirs {
-        dirs.insert(directory.clone());
+    if env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty()) {
+        // Select omp's wl-paste path. The name deliberately does not identify a
+        // real socket: only the narrow host clipboard helper is exposed.
+        result.insert("WAYLAND_DISPLAY".into(), "sbox-clipboard".into());
     }
-    dirs.insert(PathBuf::from("/usr/bin"));
-    dirs.insert(PathBuf::from("/bin"));
+
+    let mut dirs = Vec::new();
+    dirs.push(PathBuf::from("/sbox/bin"));
+    if home.join(".cargo/bin").is_dir() {
+        dirs.push(home.join(".cargo/bin"));
+    }
+    for directory in path_dirs {
+        if !dirs.contains(directory) {
+            dirs.push(directory.clone());
+        }
+    }
+    dirs.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
     result.insert(
         "PATH".into(),
         env::join_paths(dirs).context("sandbox PATH contains an invalid directory")?,
@@ -247,7 +279,7 @@ mod tests {
             Path::new("/project"),
             1000,
             &[],
-            &[name.clone()],
+            std::slice::from_ref(&name),
         )
         .unwrap_err()
         .to_string();

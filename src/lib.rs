@@ -5,10 +5,15 @@ use std::process::{Command, ExitStatus};
 
 use anyhow::Result;
 
+pub mod authority;
 pub mod cli;
+mod clipboard;
 mod config;
+mod hardening;
+pub mod lifecycle;
 pub mod mcp;
 pub mod sandbox;
+pub mod ssh;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Runtime {
@@ -41,6 +46,9 @@ pub struct LaunchSpec {
     pub read_only: Vec<PathBuf>,
     pub environment: BTreeMap<OsString, OsString>,
     pub warnings: Vec<String>,
+    pub approval: Option<PathBuf>,
+    pub git_metadata: Vec<PathBuf>,
+    pub launcher: PathBuf,
 }
 
 pub fn discover_mcp_mounts(home: &Path, project: &Path, host_path: &OsStr) -> Result<Discovery> {
@@ -60,8 +68,9 @@ pub fn build_bwrap_command(
     spec: &LaunchSpec,
     overlay_work_dir: &Path,
     omp_args: &[OsString],
-) -> Command {
-    sandbox::build_bwrap_command(spec, overlay_work_dir, omp_args)
+    ssh_bridge: Option<&Path>,
+) -> Result<Command> {
+    sandbox::build_bwrap_command(spec, overlay_work_dir, omp_args, ssh_bridge)
 }
 
 pub fn run_omp(spec: &LaunchSpec, omp_args: &[OsString]) -> Result<ExitStatus> {

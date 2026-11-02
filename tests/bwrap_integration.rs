@@ -66,6 +66,9 @@ impl Fixture {
                 ("PI_CONFIG_DIR".into(), ".omp".into()),
             ]),
             warnings: Vec::new(),
+            approval: None,
+            git_metadata: Vec::new(),
+            launcher: PathBuf::from(env!("CARGO_BIN_EXE_sbox")),
         }
     }
 }
@@ -217,7 +220,7 @@ fn omp_auth_state_survives_sbox_state_deletion() {
 
 #[test]
 #[ignore = "requires bwrap and unprivileged user namespaces"]
-fn lock_serializes_launches_sharing_an_upper() {
+fn second_launch_sharing_an_upper_fails_without_waiting() {
     let fixture = Fixture::new();
     let spec = fixture.spec(Path::new("/usr/bin/sh"));
     let first_spec = spec.clone();
@@ -233,16 +236,11 @@ fn lock_serializes_launches_sharing_an_upper() {
         thread::sleep(Duration::from_millis(20));
     }
 
-    let second_spec = spec.clone();
-    let second = thread::spawn(move || {
-        run_shell(&second_spec, "touch second-started".into());
-    });
-    thread::sleep(Duration::from_millis(300));
+    let error = run_omp(&spec, &shell_args("touch second-started".into())).unwrap_err();
+    assert!(error.to_string().contains("another sbox instance"));
     assert!(!fixture.project.join("second-started").exists());
     first.join().unwrap();
-    second.join().unwrap();
     assert!(fixture.project.join("first-finished").exists());
-    assert!(fixture.project.join("second-started").exists());
 }
 
 #[test]
@@ -276,4 +274,207 @@ fn exact_namespace_sequence_succeeds() {
     let spec = fixture.spec(Path::new("/usr/bin/true"));
     let status = run_omp(&spec, &[]).unwrap();
     assert!(status.success());
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn project_symlink_cannot_reach_private_home() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.home.join(".ssh")).unwrap();
+    fs::write(fixture.home.join(".ssh/canary"), b"private").unwrap();
+    symlink(fixture.home.join(".ssh"), fixture.project.join("escape")).unwrap();
+    run_shell(
+        &fixture.spec(Path::new("/usr/bin/sh")),
+        "test ! -e escape/canary; test ! -e \"$HOME/.ssh/canary\"".into(),
+    );
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn symlinked_directory_and_socket_grants_are_rejected() {
+    use std::os::unix::{fs::symlink, net::UnixListener};
+    let fixture = Fixture::new();
+    let private = fixture.home.join("private");
+    fs::create_dir(&private).unwrap();
+    let alias = fixture.home.join("alias");
+    symlink(&private, &alias).unwrap();
+    let mut spec = fixture.spec(Path::new("/usr/bin/true"));
+    spec.read_only.push(alias);
+    assert!(run_omp(&spec, &[]).is_err());
+    let socket = fixture.home.join("host.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    spec.read_only = vec![socket];
+    assert!(run_omp(&spec, &[]).is_err());
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn inherited_host_descriptor_is_not_visible() {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    let fixture = Fixture::new();
+    let secret = fixture.home.join("private");
+    fs::write(&secret, b"host-descriptor-canary").unwrap();
+    let file = fs::File::open(&secret).unwrap();
+    let fd = file.as_raw_fd();
+    assert_eq!(unsafe { fcntl(fd, 2, 0) }, 0);
+    run_shell(
+        &fixture.spec(Path::new("/usr/bin/sh")),
+        format!("test ! -e /proc/self/fd/{fd}"),
+    );
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn cargo_cache_is_writable_without_host_credentials_or_host_mutation() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.home.join(".cargo/registry")).unwrap();
+    fs::write(fixture.home.join(".cargo/registry/canary"), b"dependency").unwrap();
+    fs::write(fixture.home.join(".cargo/credentials.toml"), b"private").unwrap();
+    run_shell(&fixture.spec(Path::new("/usr/bin/sh")), "test ! -e \"$HOME/.cargo/credentials.toml\" && test \"$(cat \"$HOME/.cargo/registry/canary\")\" = dependency && printf sandbox > \"$HOME/.cargo/registry/canary\"".into());
+    assert_eq!(
+        fs::read(fixture.home.join(".cargo/registry/canary")).unwrap(),
+        b"dependency"
+    );
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn sandbox_cannot_change_future_mount_authority_or_native_extensions() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.home.join(".omp/agent")).unwrap();
+    fs::write(fixture.home.join(".omp/agent/mcp.json"), b"{}").unwrap();
+    let mut spec = fixture.spec(Path::new("/usr/bin/sh"));
+    sbox::authority::approve(&spec).unwrap();
+    spec.approval = Some(sbox::authority::authorize(&spec).unwrap());
+    run_shell(&spec, "if printf evil > \"$HOME/.omp/agent/mcp.json\"; then exit 81; fi; if printf evil > \"$HOME/.omp/agent/extensions/evil.js\"; then exit 82; fi; if mkdir -p \"$HOME/.config/sbox/forged\"; then exit 83; fi".into());
+    assert_eq!(
+        fs::read(fixture.home.join(".omp/agent/mcp.json")).unwrap(),
+        b"{}"
+    );
+    assert!(!fixture.home.join(".omp/agent/extensions/evil.js").exists());
+    // Even a configuration changed externally cannot grant a new path merely
+    // by appearing as an MCP argument on the next launch.
+    let private = fixture.home.join("private");
+    fs::create_dir(&private).unwrap();
+    fs::write(private.join("canary"), b"private").unwrap();
+    fs::write(
+        fixture.home.join(".omp/agent/mcp.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"mcpServers":{"bad":{"command":"/usr/bin/true","args":[private]}}}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    spec.read_only = discover_mcp_mounts(&fixture.home, &fixture.project, OsStr::new("/usr/bin"))
+        .unwrap()
+        .mount_roots;
+    assert!(
+        sbox::authority::authorize(&spec)
+            .unwrap_err()
+            .to_string()
+            .contains("requires host approval")
+    );
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn reset_preserves_project_and_native_sessions() {
+    let fixture = Fixture::new();
+    let spec = fixture.spec(Path::new("/usr/bin/sh"));
+    run_shell(&spec, "printf project > source; mkdir -p \"$HOME/.omp/agent/sessions\"; printf session > \"$HOME/.omp/agent/sessions/canary\"".into());
+    sbox::lifecycle::reset(&fixture.project).unwrap();
+    assert!(!fixture.project.join(".sbox").exists());
+    assert_eq!(
+        fs::read(fixture.project.join("source")).unwrap(),
+        b"project"
+    );
+    assert_eq!(
+        fs::read(fixture.home.join(".omp/agent/sessions/canary")).unwrap(),
+        b"session"
+    );
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn mount_source_descriptors_do_not_reopen_host_paths() {
+    let fixture = Fixture::new();
+    run_shell(&fixture.spec(Path::new("/usr/bin/sh")), "for fd in /proc/self/fd/*; do target=$(readlink \"$fd\" || :); case \"$target\" in *\"$HOME\"*) echo \"host descriptor leak: $target\"; exit 85;; esac; done".into());
+}
+
+#[test]
+#[ignore = "requires bwrap, git and unprivileged user namespaces"]
+fn linked_worktree_can_commit_without_exposing_its_parent_working_tree() {
+    use std::process::Command;
+    let fixture = Fixture::new();
+    let main = fixture.root.join("main");
+    let git = |args: &[&str]| {
+        let result = Command::new("/usr/bin/git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=QA",
+                "-c",
+                "user.email=qa@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result
+    };
+    git(&["init", "-q", main.to_str().unwrap()]);
+    git(&[
+        "-C",
+        main.to_str().unwrap(),
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "base",
+    ]);
+    git(&[
+        "-C",
+        main.to_str().unwrap(),
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "sandbox",
+        fixture.project.to_str().unwrap(),
+    ]);
+    fs::write(main.join("personal-canary"), b"private").unwrap();
+    fs::create_dir_all(fixture.home.join(".omp/agent")).unwrap();
+    let mut spec = fixture.spec(Path::new("/usr/bin/sh"));
+    spec.git_metadata = sbox::lifecycle::git_metadata(&fixture.project).unwrap();
+    sbox::authority::approve(&spec).unwrap();
+    spec.approval = Some(sbox::authority::authorize(&spec).unwrap());
+    run_shell(
+        &spec,
+        format!(
+            "git -c user.name=QA -c user.email=qa@example.invalid -c commit.gpgsign=false commit -q --allow-empty -m sandbox; test ! -e '{}/personal-canary'; if printf evil > '{}/.git/config'; then exit 86; fi",
+            main.display(),
+            main.display()
+        ),
+    );
+    let output = git(&[
+        "-C",
+        fixture.project.to_str().unwrap(),
+        "log",
+        "-1",
+        "--format=%s",
+    ]);
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "sandbox");
 }

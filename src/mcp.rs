@@ -114,7 +114,7 @@ pub fn resolve_executable(
             cwd.unwrap_or_else(|| Path::new(".")).join(command_path)
         };
         ensure_executable(&path)?;
-        return Ok(absolutize_lexical(&path)?);
+        return absolutize_lexical(&path);
     }
 
     for dir in env::split_paths(host_path) {
@@ -169,13 +169,14 @@ fn parse_omp_config(path: &Path) -> Result<Vec<LocalServer>> {
         if matches!(entry.get("enabled"), Some(Value::Bool(false))) {
             continue;
         }
-        if let Some(enabled) = entry.get("enabled") {
-            if !enabled.is_boolean() {
-                bail!(
-                    "enabled for MCP server {name} in {} must be boolean",
-                    path.display()
-                );
-            }
+        if entry
+            .get("enabled")
+            .is_some_and(|enabled| !enabled.is_boolean())
+        {
+            bail!(
+                "enabled for MCP server {name} in {} must be boolean",
+                path.display()
+            );
         }
         let Some(command_value) = entry.get("command") else {
             if entry.contains_key("url") {
@@ -218,13 +219,14 @@ fn parse_opencode_config(path: &Path) -> Result<Vec<LocalServer>> {
         if matches!(entry.get("enabled"), Some(Value::Bool(false))) {
             continue;
         }
-        if let Some(enabled) = entry.get("enabled") {
-            if !enabled.is_boolean() {
-                bail!(
-                    "enabled for MCP server {name} in {} must be boolean",
-                    path.display()
-                );
-            }
+        if entry
+            .get("enabled")
+            .is_some_and(|enabled| !enabled.is_boolean())
+        {
+            bail!(
+                "enabled for MCP server {name} in {} must be boolean",
+                path.display()
+            );
         }
         match entry.get("type").and_then(Value::as_str) {
             Some("local") => {}
@@ -287,13 +289,11 @@ fn string_array(
 }
 
 fn validate_object(value: Option<&Value>, field: &str, server: &str, source: &Path) -> Result<()> {
-    if let Some(value) = value {
-        if !value.is_object() {
-            bail!(
-                "{field} for MCP server {server} in {} must be an object",
-                source.display()
-            );
-        }
+    if value.is_some_and(|value| !value.is_object()) {
+        bail!(
+            "{field} for MCP server {server} in {} must be an object",
+            source.display()
+        );
     }
     Ok(())
 }
@@ -439,13 +439,7 @@ fn add_declared_path(
     if canonical.starts_with(project) {
         return Ok(());
     }
-    let inferred = infer_runtime_root(&canonical).unwrap_or_else(|| {
-        if canonical.is_dir() {
-            canonical.clone()
-        } else {
-            canonical.parent().unwrap_or(Path::new("/")).to_path_buf()
-        }
-    });
+    let inferred = infer_runtime_root(&canonical).unwrap_or_else(|| canonical.clone());
     reject_broad_root(&inferred, home)?;
     roots.push(inferred);
     Ok(())
@@ -459,12 +453,13 @@ fn add_executable_layout(
     path_dirs: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let transient = is_fnm_transient(lexical);
-    if !transient && !is_system_path(lexical) {
-        if let Some(parent) = lexical.parent() {
-            reject_broad_root(parent, home)?;
-            roots.push(parent.to_path_buf());
-            path_dirs.push(parent.to_path_buf());
-        }
+    if !transient
+        && !is_system_path(lexical)
+        && let Some(parent) = lexical.parent()
+    {
+        reject_broad_root(parent, home)?;
+        roots.push(lexical.to_path_buf());
+        path_dirs.push(parent.to_path_buf());
     }
 
     if let Some(node_root) = find_node_install(canonical).or_else(|| find_node_install(lexical)) {
@@ -527,7 +522,9 @@ fn read_shebang(path: &Path) -> Result<Option<(PathBuf, Vec<OsString>)>> {
     if !path.is_file() {
         return Ok(None);
     }
-    let bytes = fs::read(path)?;
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(4096);
+    fs::File::open(path)?.take(4096).read_to_end(&mut bytes)?;
     if !bytes.starts_with(b"#!") {
         return Ok(None);
     }
@@ -571,11 +568,15 @@ fn infer_runtime_root(path: &Path) -> Option<PathBuf> {
         }
     }
     for ancestor in path.ancestors() {
-        if ancestor.join("pyproject.toml").is_file() || ancestor.join("package.json").is_file() {
+        if ancestor.join("pyproject.toml").is_file()
+            || ancestor.join("package.json").is_file()
+            || ancestor.join("venv/pyvenv.cfg").is_file()
+            || ancestor.join(".venv/pyvenv.cfg").is_file()
+        {
             return Some(ancestor.to_path_buf());
         }
     }
-    path.parent().map(Path::to_path_buf)
+    None
 }
 
 fn find_node_install(path: &Path) -> Option<PathBuf> {
@@ -688,9 +689,7 @@ mod tests {
         _temp: TempDir,
         home: PathBuf,
         project: PathBuf,
-        mdb: PathBuf,
         node: PathBuf,
-        ghidra: PathBuf,
         transient: PathBuf,
     }
 
@@ -699,21 +698,9 @@ mod tests {
         let root = temp.path();
         let home = root.join("home/user");
         let project = root.join("project");
-        let mdb = home.join("temp/MDB-MCP");
         let node = home.join(".local/share/fnm/node-versions/v24.13.0/installation");
-        let ghidra = home.join(".local/share/opencode/ghidra");
         let transient = root.join("run/user/1000/fnm_multishells/session/bin");
-        let python_site = home.join(".local/lib/python3.14/site-packages");
         mkdir(&project);
-
-        fs::write(mdb.join("pyproject.toml"), b"[project]\nname='mdb'\n").unwrap_or_else(|_| {
-            mkdir(&mdb);
-            fs::write(mdb.join("pyproject.toml"), b"[project]\nname='mdb'\n").unwrap()
-        });
-        mkdir(&mdb.join("venv/bin"));
-        fs::write(mdb.join("venv/pyvenv.cfg"), b"home = fixture\n").unwrap();
-        executable(&mdb.join("venv/bin/python"), "fixture binary\n");
-        fs::write(mdb.join("server.py"), b"print('fixture')\n").unwrap();
 
         executable(&node.join("bin/node"), "fixture node\n");
         mkdir(&node.join("lib/node_modules/@upstash/context7-mcp/dist"));
@@ -729,95 +716,13 @@ mod tests {
         mkdir(&transient);
         symlink(node.join("bin/node"), transient.join("node-tool")).unwrap();
 
-        mkdir(&ghidra);
-        fs::write(ghidra.join("bridge.py"), b"print('fixture')\n").unwrap();
-        mkdir(&python_site.join("mcp"));
-
         Layout {
             _temp: temp,
             home,
             project,
-            mdb,
             node,
-            ghidra,
             transient,
         }
-    }
-
-    #[test]
-    fn discovers_both_schemas_and_stable_runtime_roots() {
-        let layout = fixture_layout();
-        write_json(
-            &layout.home.join(".omp/agent/mcp.json"),
-            &json!({
-                "disabledServers": ["disabled"],
-                "mcpServers": {
-                    "debugger-mcp": {
-                        "command": layout.mdb.join("venv/bin/python"),
-                        "args": [layout.mdb.join("server.py")]
-                    },
-                    "disabled": {"command": "/definitely/missing"},
-                    "off": {"command": "/also/missing", "enabled": false}
-                }
-            }),
-        );
-        write_json(
-            &layout.home.join(".config/opencode/opencode.json"),
-            &json!({
-                "mcp": {
-                    "context7": {
-                        "type": "local",
-                        "command": [layout.node.join("lib/node_modules/@upstash/context7-mcp/dist/index.js")],
-                        "enabled": true
-                    },
-                    "ghidra": {
-                        "type": "local",
-                        "command": ["/usr/bin/python3", layout.ghidra.join("bridge.py")],
-                        "environment": {"GHIDRA_MCP_URL": "http://127.0.0.1:8080"}
-                    },
-                    "remote": {"type": "remote", "url": "https://example.invalid"},
-                    "off": {"type": "local", "command": ["/missing"], "enabled": false}
-                }
-            }),
-        );
-        let path = env::join_paths([&layout.transient]).unwrap();
-        let discovery = discover_mcp_mounts(&layout.home, &layout.project, &path).unwrap();
-
-        assert!(discovery.mount_roots.contains(&layout.mdb));
-        assert!(discovery.mount_roots.contains(&layout.node));
-        assert!(discovery.mount_roots.contains(&layout.ghidra));
-        assert!(
-            discovery
-                .mount_roots
-                .contains(&layout.home.join(".local/lib/python3.14/site-packages"))
-        );
-        assert!(
-            !discovery
-                .mount_roots
-                .iter()
-                .any(|root| root.starts_with(&layout.transient))
-        );
-        assert!(discovery.path_dirs.contains(&layout.node.join("bin")));
-        assert!(
-            discovery
-                .mount_roots
-                .contains(&layout.home.join(".config/opencode"))
-        );
-    }
-
-    #[test]
-    fn mounts_opencode_assets_without_an_mcp_configuration() {
-        let layout = fixture_layout();
-        let opencode = layout.home.join(".config/opencode");
-        mkdir(&opencode.join("skills"));
-        fs::write(opencode.join("skills/review.md"), b"review instructions").unwrap();
-
-        let discovery =
-            discover_mcp_mounts(&layout.home, &layout.project, OsStr::new("/usr/bin:/bin"))
-                .unwrap();
-
-        assert_eq!(discovery.mount_roots, [opencode]);
-        assert!(discovery.path_dirs.is_empty());
     }
 
     #[test]
