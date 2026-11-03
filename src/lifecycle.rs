@@ -40,16 +40,20 @@ pub fn report(spec: &LaunchSpec) {
         spec.home.join(".omp/agent").display()
     );
     println!("Global omp config/extensions: read-only approved snapshot");
-    println!("Private caches/overlays: {}", spec.state_dir.display());
+    println!(
+        "Private instance state: {}",
+        spec.state_dir.join("instances").display()
+    );
     for path in &spec.read_only {
         println!("External read-only: {}", path.display());
     }
     for path in &spec.git_metadata {
         println!("Approved Git metadata read/write: {}", path.display());
     }
-    println!(
-        "SSH aliases: kali-vm, windows-vm -> windows-builder, windows-builder (keys stay on host)"
-    );
+    println!("Native ssh/scp/sftp; host-approved credentials, no private key files");
+    for host in &spec.ssh_hosts {
+        println!("SSH credential destination: {host}");
+    }
     println!(
         "Clipboard: host Wayland format listing/text/image reads; compositor socket stays hidden"
     );
@@ -57,7 +61,8 @@ pub fn report(spec: &LaunchSpec) {
     println!("Linked-worktree Git configuration/hooks: read-only approved snapshot");
 }
 
-pub fn reset(project: &Path) -> Result<()> {
+pub fn reset(home: &Path, project: &Path) -> Result<()> {
+    let _guard = crate::state::exclusive(home, project)?;
     let root = project.join(".sbox");
     if !root.exists() {
         return Ok(());
@@ -65,15 +70,8 @@ pub fn reset(project: &Path) -> Result<()> {
     if fs::canonicalize(&root)? != root {
         bail!("refusing to reset symlinked state directory");
     }
-    let lock = root.join("state/omp.lock");
-    let guard = if lock.exists() {
-        Some(crate::sandbox::acquire_state_lock(&lock)?)
-    } else {
-        None
-    };
-    // remove_dir_all does not follow symlinks. Keep the lock until deletion ends.
+    // The stable control lock stays outside the directory being removed.
     fs::remove_dir_all(&root)?;
-    drop(guard);
     println!("Removed private sandbox state only: {}", root.display());
     Ok(())
 }

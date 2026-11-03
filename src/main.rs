@@ -16,15 +16,13 @@ fn main() -> ExitCode {
 }
 
 fn execute() -> anyhow::Result<u8> {
-    match std::env::args_os()
+    if let Some("wl-paste") = std::env::args_os()
         .next()
         .as_deref()
         .and_then(|arg| std::path::Path::new(arg).file_name())
         .and_then(|name| name.to_str())
     {
-        Some("ssh") => return sbox::ssh::client(std::env::args().skip(1)),
-        Some("wl-paste") => return sbox::ssh::clipboard_client(std::env::args().skip(1)),
-        _ => {}
+        return sbox::bridge::client(std::env::args().skip(1));
     }
     if std::env::args_os()
         .nth(1)
@@ -35,7 +33,10 @@ fn execute() -> anyhow::Result<u8> {
     let cli = Cli::parse();
     if cli.reset {
         let project = std::fs::canonicalize(&cli.project)?;
-        sbox::lifecycle::reset(&project)?;
+        let home = std::fs::canonicalize(
+            std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?,
+        )?;
+        sbox::lifecycle::reset(&home, &project)?;
         return Ok(0);
     }
     if !cli.no_limits && !cli.scoped && !cli.trust && !cli.permissions {
@@ -57,7 +58,7 @@ fn execute() -> anyhow::Result<u8> {
         }
         return Ok(0);
     }
-    spec.approval = Some(sbox::authority::authorize(&spec)?);
+    spec.approval = Some(sbox::authority::directory(&spec.home, &spec.project));
     Ok(status_code(run_omp(&spec, &cli.omp_args)?))
 }
 

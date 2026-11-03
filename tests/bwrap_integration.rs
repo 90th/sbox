@@ -69,6 +69,7 @@ impl Fixture {
             approval: None,
             git_metadata: Vec::new(),
             launcher: PathBuf::from(env!("CARGO_BIN_EXE_sbox")),
+            ssh_hosts: Vec::new(),
         }
     }
 }
@@ -168,7 +169,6 @@ fn omp_overlay_persists_without_changing_lower_or_exposing_state() {
         "printf sandbox > \"$HOME/.omp/value\"; test ! -e \"$PWD/.sbox/state\"; ! mkdir \"$PWD/.sbox/state\"".into(),
     );
     assert_eq!(fs::read(&lower).unwrap(), b"host lower");
-    assert!(fixture.project.join(".sbox/state/omp-upper").is_dir());
 
     run_shell(&spec, "cat \"$HOME/.omp/value\" > observed".into());
     assert_eq!(
@@ -216,31 +216,6 @@ fn omp_auth_state_survives_sbox_state_deletion() {
 
     fs::remove_dir_all(fixture.project.join(".sbox")).unwrap();
     assert_eq!(fs::read(marker).unwrap(), b"shared");
-}
-
-#[test]
-#[ignore = "requires bwrap and unprivileged user namespaces"]
-fn second_launch_sharing_an_upper_fails_without_waiting() {
-    let fixture = Fixture::new();
-    let spec = fixture.spec(Path::new("/usr/bin/sh"));
-    let first_spec = spec.clone();
-    let first = thread::spawn(move || {
-        run_shell(
-            &first_spec,
-            "touch first-started; sleep 2; touch first-finished".into(),
-        );
-    });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !fixture.project.join("first-started").exists() {
-        assert!(Instant::now() < deadline, "first payload did not start");
-        thread::sleep(Duration::from_millis(20));
-    }
-
-    let error = run_omp(&spec, &shell_args("touch second-started".into())).unwrap_err();
-    assert!(error.to_string().contains("another sbox instance"));
-    assert!(!fixture.project.join("second-started").exists());
-    first.join().unwrap();
-    assert!(fixture.project.join("first-finished").exists());
 }
 
 #[test]
@@ -386,7 +361,7 @@ fn reset_preserves_project_and_native_sessions() {
     let fixture = Fixture::new();
     let spec = fixture.spec(Path::new("/usr/bin/sh"));
     run_shell(&spec, "printf project > source; mkdir -p \"$HOME/.omp/agent/sessions\"; printf session > \"$HOME/.omp/agent/sessions/canary\"".into());
-    sbox::lifecycle::reset(&fixture.project).unwrap();
+    sbox::lifecycle::reset(&fixture.home, &fixture.project).unwrap();
     assert!(!fixture.project.join(".sbox").exists());
     assert_eq!(
         fs::read(fixture.project.join("source")).unwrap(),
@@ -477,4 +452,162 @@ fn linked_worktree_can_commit_without_exposing_its_parent_working_tree() {
         "--format=%s",
     ]);
     assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "sandbox");
+}
+
+#[test]
+fn newly_discovered_ssh_host_requires_explicit_host_approval() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.home.join(".omp/agent")).unwrap();
+    fs::create_dir(fixture.home.join(".ssh")).unwrap();
+    fs::write(
+        fixture.home.join(".ssh/config"),
+        "Host existing-build-host\n HostName example.invalid\n",
+    )
+    .unwrap();
+    let mut spec = fixture.spec(Path::new("/usr/bin/true"));
+    spec.ssh_hosts = sbox::ssh_hosts::configured_hosts(&fixture.home).unwrap();
+    sbox::authority::approve(&spec).unwrap();
+    fs::write(
+        fixture.home.join(".ssh/config"),
+        "Host existing-build-host new-credential-host\n HostName example.invalid\n",
+    )
+    .unwrap();
+    spec.ssh_hosts = sbox::ssh_hosts::configured_hosts(&fixture.home).unwrap();
+    let error = sbox::authority::authorize(&spec).unwrap_err().to_string();
+    assert!(
+        error.contains("new SSH credential destination new-credential-host requires host approval")
+    );
+}
+
+struct RunningSandbox {
+    release: PathBuf,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl RunningSandbox {
+    fn finish(mut self) {
+        fs::write(&self.release, b"release").unwrap();
+        self.handle.take().unwrap().join().unwrap();
+    }
+}
+
+impl Drop for RunningSandbox {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, b"release");
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "sandbox did not signal readiness"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn concurrent_instances_have_independent_persistent_overlays_and_shared_project_files() {
+    let fixture = Fixture::new();
+    fs::write(fixture.home.join(".omp/value"), b"lower").unwrap();
+    fs::create_dir_all(fixture.home.join(".cargo/registry")).unwrap();
+    fs::write(fixture.home.join(".cargo/registry/value"), b"lower").unwrap();
+    let spec = fixture.spec(Path::new("/usr/bin/sh"));
+    let first_spec = spec.clone();
+    let first = RunningSandbox {
+        release: fixture.project.join("release-first"),
+        handle: Some(thread::spawn(move || {
+            run_shell(&first_spec, "set -eu; printf first > \"$HOME/.omp/value\"; printf first > \"$HOME/.cargo/registry/value\"; touch first-ready; while test ! -e release-first; do sleep 0.02; done; test \"$(cat \"$HOME/.omp/value\")\" = first; test \"$(cat \"$HOME/.cargo/registry/value\")\" = first".into());
+        })),
+    };
+    wait_for(&fixture.project.join("first-ready"));
+    run_shell(&spec, "set -eu; test -e first-ready; test \"$(cat \"$HOME/.omp/value\")\" = lower; test \"$(cat \"$HOME/.cargo/registry/value\")\" = lower; printf second > \"$HOME/.omp/value\"; printf second > \"$HOME/.cargo/registry/value\"; touch second-completed".into());
+    assert!(fixture.project.join("second-completed").exists());
+    // While the first instance is still live, the freed second slot is reusable.
+    run_shell(&spec, "set -eu; test \"$(cat \"$HOME/.omp/value\")\" = second; test \"$(cat \"$HOME/.cargo/registry/value\")\" = second".into());
+    assert!(sbox::lifecycle::reset(&fixture.home, &fixture.project).is_err());
+    assert!(sbox::authority::approve(&spec).is_err());
+    assert!(fixture.project.join(".sbox").is_dir());
+    first.finish();
+    run_shell(&spec, "set -eu; test \"$(cat \"$HOME/.omp/value\")\" = first; test \"$(cat \"$HOME/.cargo/registry/value\")\" = first".into());
+    assert_eq!(fs::read(fixture.home.join(".omp/value")).unwrap(), b"lower");
+    assert_eq!(
+        fs::read(fixture.home.join(".cargo/registry/value")).unwrap(),
+        b"lower"
+    );
+    sbox::authority::approve(&spec).unwrap();
+    sbox::lifecycle::reset(&fixture.home, &fixture.project).unwrap();
+    assert!(fixture.project.join("second-completed").exists());
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn new_instances_can_coexist_with_an_old_launcher_lock_without_touching_old_state() {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    let fixture = Fixture::new();
+    let state = fixture.project.join(".sbox/state");
+    fs::create_dir_all(state.join("omp-upper")).unwrap();
+    fs::write(
+        state.join("omp-upper/legacy-value"),
+        b"running-old-instance",
+    )
+    .unwrap();
+    let legacy = fs::File::create(state.join("omp.lock")).unwrap();
+    assert_eq!(unsafe { flock(legacy.as_raw_fd(), 2 | 4) }, 0);
+    let spec = fixture.spec(Path::new("/usr/bin/sh"));
+    run_shell(&spec, "set -eu; test ! -e \"$HOME/.omp/legacy-value\"; printf new > \"$HOME/.omp/value\"; touch new-completed".into());
+    assert!(fixture.project.join("new-completed").exists());
+    assert!(sbox::lifecycle::reset(&fixture.home, &fixture.project).is_err());
+    assert!(sbox::authority::approve(&spec).is_err());
+    assert_eq!(
+        fs::read(state.join("omp-upper/legacy-value")).unwrap(),
+        b"running-old-instance"
+    );
+    drop(legacy);
+    sbox::lifecycle::reset(&fixture.home, &fixture.project).unwrap();
+    assert!(fixture.project.join("new-completed").exists());
+}
+
+#[test]
+#[ignore = "requires bwrap and unprivileged user namespaces"]
+fn simultaneous_first_launches_allocate_distinct_state_without_initialization_races() {
+    use std::sync::{Arc, Barrier};
+    let fixture = Fixture::new();
+    let barrier = Arc::new(Barrier::new(3));
+    let mut children = Vec::new();
+    for name in ["alpha", "beta"] {
+        let spec = fixture.spec(Path::new("/usr/bin/sh"));
+        let start = barrier.clone();
+        children.push(RunningSandbox {
+            release:fixture.project.join("release"),
+            handle:Some(thread::spawn(move|| {
+                start.wait();
+                run_shell(&spec,format!("set -eu; test ! -e \"$HOME/.omp/own\"; printf {name} > \"$HOME/.omp/own\"; touch {name}-ready; while test ! -e release; do sleep 0.02; done; cat \"$HOME/.omp/own\" > {name}-observed"));
+            })),
+        });
+    }
+    barrier.wait();
+    wait_for(&fixture.project.join("alpha-ready"));
+    wait_for(&fixture.project.join("beta-ready"));
+    for child in children {
+        child.finish();
+    }
+    assert_eq!(
+        fs::read(fixture.project.join("alpha-observed")).unwrap(),
+        b"alpha"
+    );
+    assert_eq!(
+        fs::read(fixture.project.join("beta-observed")).unwrap(),
+        b"beta"
+    );
+    assert!(!fixture.home.join(".omp/own").exists());
 }

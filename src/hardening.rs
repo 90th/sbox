@@ -1,6 +1,6 @@
 use crate::LaunchSpec;
 use anyhow::{Context, Result, bail};
-use std::fs;
+use std::fs::{self, File};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
@@ -60,10 +60,10 @@ pub(crate) fn validate(spec: &LaunchSpec) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn prepare(spec: &LaunchSpec, work: &Path) -> Result<()> {
+pub(crate) fn prepare(spec: &LaunchSpec, instance_dir: &Path, work: &Path) -> Result<()> {
     for name in ["cargo-home", "rustup-home", "npm-cache", "cache"] {
-        fs::create_dir_all(spec.state_dir.join(name))?;
-        if fs::canonicalize(spec.state_dir.join(name))? != spec.state_dir.join(name) {
+        fs::create_dir_all(instance_dir.join(name))?;
+        if fs::canonicalize(instance_dir.join(name))? != instance_dir.join(name) {
             bail!("sandbox cache directory must not traverse symlinks");
         }
     }
@@ -76,9 +76,9 @@ pub(crate) fn prepare(spec: &LaunchSpec, work: &Path) -> Result<()> {
                     source.display()
                 );
             }
-            fs::create_dir_all(spec.state_dir.join(format!("cargo-{name}-upper")))?;
-            if fs::canonicalize(spec.state_dir.join(format!("cargo-{name}-upper")))?
-                != spec.state_dir.join(format!("cargo-{name}-upper"))
+            fs::create_dir_all(instance_dir.join(format!("cargo-{name}-upper")))?;
+            if fs::canonicalize(instance_dir.join(format!("cargo-{name}-upper")))?
+                != instance_dir.join(format!("cargo-{name}-upper"))
             {
                 bail!("Cargo overlay upper must not traverse symlinks");
             }
@@ -88,17 +88,17 @@ pub(crate) fn prepare(spec: &LaunchSpec, work: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn mounts(command: &mut Command, spec: &LaunchSpec, work: &Path) {
+pub(crate) fn mounts(command: &mut Command, spec: &LaunchSpec, instance_dir: &Path, work: &Path) {
     for (source, destination) in [("npm-cache", ".npm"), ("cache", ".cache")] {
         command
             .arg("--bind")
-            .arg(spec.state_dir.join(source))
+            .arg(instance_dir.join(source))
             .arg(spec.home.join(destination));
     }
     let cargo = spec.home.join(".cargo");
     command
         .arg("--bind")
-        .arg(spec.state_dir.join("cargo-home"))
+        .arg(instance_dir.join("cargo-home"))
         .arg(&cargo);
     for name in ["registry", "git"] {
         let source = cargo.join(name);
@@ -107,7 +107,7 @@ pub(crate) fn mounts(command: &mut Command, spec: &LaunchSpec, work: &Path) {
                 .arg("--overlay-src")
                 .arg(source)
                 .arg("--overlay")
-                .arg(spec.state_dir.join(format!("cargo-{name}-upper")))
+                .arg(instance_dir.join(format!("cargo-{name}-upper")))
                 .arg(work.join(name))
                 .arg(cargo.join(name));
         }
@@ -115,7 +115,7 @@ pub(crate) fn mounts(command: &mut Command, spec: &LaunchSpec, work: &Path) {
     let rustup = spec.home.join(".rustup");
     command
         .arg("--bind")
-        .arg(spec.state_dir.join("rustup-home"))
+        .arg(instance_dir.join("rustup-home"))
         .arg(&rustup);
     for name in ["toolchains", "settings.toml"] {
         let source = rustup.join(name);
@@ -137,7 +137,7 @@ pub(crate) fn mounts(command: &mut Command, spec: &LaunchSpec, work: &Path) {
     }
 }
 
-pub(crate) fn secure_descriptors(command: &mut Command) -> Result<()> {
+pub(crate) fn secure_descriptors(command: &mut Command, lease: &File) -> Result<()> {
     use std::ffi::{CString, OsString};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -153,8 +153,12 @@ pub(crate) fn secure_descriptors(command: &mut Command) -> Result<()> {
         fn syscall(number: i64, ...) -> i64;
     }
     let mut replacement = Command::new(command.get_program());
+    let lease = lease.try_clone()?;
+    replacement
+        .arg("--sync-fd")
+        .arg(lease.as_raw_fd().to_string());
     let mut args = command.get_args();
-    let mut sources = Vec::new();
+    let mut sources = vec![lease];
     while let Some(arg) = args.next() {
         if arg == "--" {
             replacement.arg(arg).args(args);
@@ -219,8 +223,8 @@ pub(crate) fn secure_descriptors(command: &mut Command) -> Result<()> {
             replacement.arg(arg);
         }
     }
-    // Pin mount sources before spawning; only those descriptors, not arbitrary
-    // inherited host handles, survive exec into bwrap. bwrap consumes them.
+    // Retain the slot lease in bwrap's supervisor until the sandbox exits.
+    // The trusted payload drops construction descriptors before starting omp.
     unsafe {
         replacement.pre_exec(move || {
             if close_range(3, u32::MAX, 4) != 0 {

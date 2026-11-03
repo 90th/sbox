@@ -1,8 +1,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
@@ -11,12 +10,7 @@ use tempfile::Builder;
 
 use crate::LaunchSpec;
 use crate::mcp::dedupe_roots;
-
-unsafe extern "C" {
-    fn flock(fd: i32, operation: i32) -> i32;
-}
-
-const LOCK_EX: i32 = 2;
+use crate::state::private_directory;
 
 const ETC_PATHS: &[&str] = &[
     "passwd",
@@ -37,6 +31,7 @@ const ETC_PATHS: &[&str] = &[
 
 pub fn build_bwrap_command(
     spec: &LaunchSpec,
+    instance_dir: &Path,
     overlay_work_dir: &Path,
     omp_args: &[OsString],
     ssh_bridge: Option<&Path>,
@@ -49,15 +44,6 @@ pub fn build_bwrap_command(
         "--disable-userns",
         "--die-with-parent",
     ]);
-
-    command
-        .arg("--bind")
-        .arg(spec.state_dir.join("omp.lock"))
-        .arg("/.sbox-omp.lock")
-        .arg("--lock-file")
-        .arg("/.sbox-omp.lock")
-        .arg("--remount-ro")
-        .arg("/.sbox-omp.lock");
 
     command.args(["--proc", "/proc", "--dev", "/dev"]);
     command.args(["--perms", "1777", "--tmpfs", "/tmp"]);
@@ -95,10 +81,10 @@ pub fn build_bwrap_command(
         .arg("--overlay-src")
         .arg(spec.home.join(".omp"))
         .arg("--overlay")
-        .arg(spec.state_dir.join("omp-upper"))
+        .arg(instance_dir.join("omp-upper"))
         .arg(overlay_work_dir)
         .arg(spec.home.join(".omp"));
-    crate::hardening::mounts(&mut command, spec, overlay_work_dir);
+    crate::hardening::mounts(&mut command, spec, instance_dir, overlay_work_dir);
     for name in ["run", "ssh-control"] {
         command
             .args(["--perms", "0700", "--tmpfs"])
@@ -139,11 +125,13 @@ pub fn build_bwrap_command(
         command
             .arg("--ro-bind")
             .arg(&spec.launcher)
-            .arg("/sbox/bin/ssh");
-        command
-            .arg("--ro-bind")
-            .arg(&spec.launcher)
             .arg("/sbox/bin/wl-paste");
+        if directory.join("ssh").is_dir() {
+            command
+                .arg("--ro-bind")
+                .arg(directory.join("ssh"))
+                .arg(spec.home.join(".ssh"));
+        }
     }
 
     add_parent_dirs(&mut command, &spec.project, &mut created_parents);
@@ -160,6 +148,14 @@ pub fn build_bwrap_command(
     for (name, value) in &spec.environment {
         command.arg("--setenv").arg(name).arg(value);
     }
+    if let Some(directory) = ssh_bridge
+        && directory.join("ssh-agent").exists()
+    {
+        command
+            .arg("--setenv")
+            .arg("SSH_AUTH_SOCK")
+            .arg("/run/sbox-host/ssh-agent");
+    }
     command.arg("--chdir").arg(&spec.project);
     command
         .arg("--")
@@ -172,16 +168,27 @@ pub fn build_bwrap_command(
 
 pub fn run_omp(spec: &LaunchSpec, omp_args: &[OsString]) -> Result<ExitStatus> {
     preflight(spec)?;
+    let _project_lock = crate::state::shared(&spec.home, &spec.project)?;
+    if let Some(directory) = &spec.approval
+        && crate::authority::authorize(spec)? != *directory
+    {
+        bail!("sandbox approval directory does not match the project");
+    }
     prepare_state(spec)?;
-    let _state_lock = acquire_state_lock(&spec.state_dir.join("omp.lock"))?;
+    let instance = crate::state::Instance::acquire(spec)?;
     let _bridge = if spec.approval.is_some() {
-        Some(crate::ssh::Bridge::start(crate::ssh::hosts())?)
+        Some(crate::bridge::Bridge::start()?)
+    } else {
+        None
+    };
+    let _agent = if let Some(bridge) = &_bridge {
+        crate::native_ssh::Agent::start(&spec.home, &bridge.directory, &spec.ssh_hosts)?
     } else {
         None
     };
     let work = Builder::new()
         .prefix("omp-work-")
-        .tempdir_in(&spec.state_dir)
+        .tempdir_in(&instance.directory)
         .with_context(|| {
             format!(
                 "cannot create OverlayFS work directory in {}",
@@ -189,15 +196,16 @@ pub fn run_omp(spec: &LaunchSpec, omp_args: &[OsString]) -> Result<ExitStatus> {
             )
         })?;
     fs::set_permissions(work.path(), fs::Permissions::from_mode(0o700))?;
-    crate::hardening::prepare(spec, work.path())?;
+    crate::hardening::prepare(spec, &instance.directory, work.path())?;
 
     let mut command = build_bwrap_command(
         spec,
+        &instance.directory,
         work.path(),
         omp_args,
         _bridge.as_ref().map(|bridge| bridge.directory.as_path()),
     )?;
-    crate::hardening::secure_descriptors(&mut command)?;
+    crate::hardening::secure_descriptors(&mut command, &instance.lease)?;
     let launch = command.status().with_context(|| {
         format!(
             "failed to launch Bubblewrap {}; required overlay isolation was not weakened",
@@ -220,7 +228,7 @@ pub fn run_omp(spec: &LaunchSpec, omp_args: &[OsString]) -> Result<ExitStatus> {
     }
 }
 
-fn make_tree_removable(path: &Path) -> Result<()> {
+pub(crate) fn make_tree_removable(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_dir() {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
@@ -231,21 +239,6 @@ fn make_tree_removable(path: &Path) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
-}
-
-pub(crate) fn acquire_state_lock(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("cannot open state lock {}", path.display()))?;
-    // SAFETY: `file` owns a valid descriptor for the duration of the call.
-    if unsafe { flock(file.as_raw_fd(), LOCK_EX | 4) } != 0 {
-        bail!(
-            "another sbox instance is using this project; close its pane before launching or resetting"
-        );
-    }
-    Ok(file)
 }
 
 fn preflight(spec: &LaunchSpec) -> Result<()> {
@@ -294,11 +287,9 @@ fn prepare_state(spec: &LaunchSpec) -> Result<()> {
             expected.display()
         );
     }
-    ensure_private_directory(&spec.project.join(".sbox"))?;
+    private_directory(&spec.project.join(".sbox"))?;
     prepare_shared_agent_dir(spec)?;
-
-    ensure_private_directory(&spec.state_dir)?;
-    ensure_private_directory(&spec.state_dir.join("omp-upper"))?;
+    private_directory(&spec.state_dir)?;
 
     let canonical_state = fs::canonicalize(&spec.state_dir)?;
     if !canonical_state.starts_with(&spec.project) {
@@ -309,57 +300,11 @@ fn prepare_state(spec: &LaunchSpec) -> Result<()> {
         );
     }
 
-    let lock = spec.state_dir.join("omp.lock");
-    if let Ok(metadata) = fs::symlink_metadata(&lock)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
-    {
-        bail!("state lock {} must be a regular file", lock.display());
-    }
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .custom_flags(0x20000)
-        .write(true)
-        .mode(0o600)
-        .open(&lock)
-        .with_context(|| format!("cannot create state lock {}", lock.display()))?;
-    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 fn prepare_shared_agent_dir(spec: &LaunchSpec) -> Result<()> {
-    ensure_private_directory(&spec.home.join(".omp/agent"))?;
-    Ok(())
-}
-
-fn ensure_private_directory(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                bail!(
-                    "sandbox state component {} must not be a symlink",
-                    path.display()
-                );
-            }
-            if !metadata.is_dir() {
-                bail!(
-                    "sandbox state component {} is not a directory",
-                    path.display()
-                );
-            }
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = DirBuilder::new();
-            builder.mode(0o700);
-            builder.create(path).with_context(|| {
-                format!("cannot create private state directory {}", path.display())
-            })?;
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
-        }
-    }
+    private_directory(&spec.home.join(".omp/agent"))?;
     Ok(())
 }
 

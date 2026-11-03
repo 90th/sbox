@@ -28,9 +28,11 @@ struct Approval {
     project: PathBuf,
     grants: Vec<PathBuf>,
     git_metadata: Vec<PathBuf>,
+    #[serde(default)]
+    ssh_hosts: Vec<String>,
 }
 
-pub(crate) fn directory(home: &Path, project: &Path) -> PathBuf {
+pub fn directory(home: &Path, project: &Path) -> PathBuf {
     let mut hash = DefaultHasher::new();
     project.hash(&mut hash);
     home.join(".config/sbox/approvals")
@@ -42,6 +44,13 @@ pub fn authorize(spec: &LaunchSpec) -> Result<PathBuf> {
     let approval: Approval = serde_json::from_slice(&fs::read(dir.join("approval.json")).context("external dependencies are not approved; run sbox --trust --project PATH from your host terminal first")?)?;
     if approval.project != spec.project {
         bail!("approval belongs to a different project");
+    }
+    for host in &spec.ssh_hosts {
+        if !approval.ssh_hosts.contains(host) {
+            bail!(
+                "new SSH credential destination {host} requires host approval; inspect --permissions then run --trust"
+            );
+        }
     }
     for path in &spec.git_metadata {
         if !approval.git_metadata.contains(path) {
@@ -68,12 +77,7 @@ pub fn authorize(spec: &LaunchSpec) -> Result<PathBuf> {
 
 pub fn approve(spec: &LaunchSpec) -> Result<()> {
     crate::hardening::validate(spec)?;
-    let lock = spec.state_dir.join("omp.lock");
-    let _guard = if lock.exists() {
-        Some(crate::sandbox::acquire_state_lock(&lock)?)
-    } else {
-        None
-    };
+    let _guard = crate::state::exclusive(&spec.home, &spec.project)?;
     let dir = directory(&spec.home, &spec.project);
     fs::create_dir_all(&dir)?;
     if fs::canonicalize(&dir)? != dir {
@@ -142,6 +146,7 @@ pub fn approve(spec: &LaunchSpec) -> Result<()> {
         project: spec.project.clone(),
         grants: spec.read_only.clone(),
         git_metadata: spec.git_metadata.clone(),
+        ssh_hosts: spec.ssh_hosts.clone(),
     };
     let mut data = serde_json::to_value(approval)?;
     data["snapshot"] =

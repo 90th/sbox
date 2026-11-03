@@ -53,6 +53,10 @@ pub struct Cli {
     #[arg(long)]
     pub strict_mcp: bool,
 
+    /// Add a concrete host when SSH config contains only wildcard Host rules.
+    #[arg(long, value_name = "HOST")]
+    pub ssh_host: Vec<String>,
+
     /// Approve the current external dependency grants from the host terminal.
     #[arg(long, conflicts_with_all = ["reset", "permissions"])]
     pub trust: bool,
@@ -122,6 +126,13 @@ impl Cli {
         pass_env.extend(self.pass_env.iter().cloned());
         let uid = home.metadata()?.uid();
         let environment = build_environment(&home, &project, uid, &path_dirs, &pass_env)?;
+        let mut ssh_hosts = crate::ssh_hosts::configured_hosts(&home)?;
+        ssh_hosts.extend(self.ssh_host.iter().cloned());
+        ssh_hosts.sort();
+        ssh_hosts.dedup();
+        for host in &ssh_hosts {
+            crate::ssh_hosts::validate_alias(host)?;
+        }
 
         Ok(LaunchSpec {
             bwrap,
@@ -136,6 +147,7 @@ impl Cli {
             approval: None,
             git_metadata,
             launcher: std::env::current_exe()?,
+            ssh_hosts,
         })
     }
 }

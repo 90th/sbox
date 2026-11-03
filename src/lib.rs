@@ -6,14 +6,17 @@ use std::process::{Command, ExitStatus};
 use anyhow::Result;
 
 pub mod authority;
+pub mod bridge;
 pub mod cli;
 mod clipboard;
 mod config;
 mod hardening;
 pub mod lifecycle;
 pub mod mcp;
+mod native_ssh;
 pub mod sandbox;
-pub mod ssh;
+pub mod ssh_hosts;
+mod state;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Runtime {
@@ -49,6 +52,7 @@ pub struct LaunchSpec {
     pub approval: Option<PathBuf>,
     pub git_metadata: Vec<PathBuf>,
     pub launcher: PathBuf,
+    pub ssh_hosts: Vec<String>,
 }
 
 pub fn discover_mcp_mounts(home: &Path, project: &Path, host_path: &OsStr) -> Result<Discovery> {
@@ -66,11 +70,12 @@ pub fn discover_mcp_mounts_with_policy(
 
 pub fn build_bwrap_command(
     spec: &LaunchSpec,
+    instance_dir: &Path,
     overlay_work_dir: &Path,
     omp_args: &[OsString],
     ssh_bridge: Option<&Path>,
 ) -> Result<Command> {
-    sandbox::build_bwrap_command(spec, overlay_work_dir, omp_args, ssh_bridge)
+    sandbox::build_bwrap_command(spec, instance_dir, overlay_work_dir, omp_args, ssh_bridge)
 }
 
 pub fn run_omp(spec: &LaunchSpec, omp_args: &[OsString]) -> Result<ExitStatus> {
